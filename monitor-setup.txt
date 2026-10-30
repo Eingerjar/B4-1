@@ -1,0 +1,571 @@
+Script started on 2026-10-01 01:39:12+00:00 [TERM="xterm-256color" TTY="/dev/pts/3" COLUMNS="208" LINES="51"]
+[?2004h]0;cgim@agent-vm: ~[01;32mcgim@agent-vm[00m:[01;34m~[00m$ [7mecho "===== 앱 프로세스 및 LISTEN 확인 ====="[27m
+[7mdate[27m
+
+[7mps -u agent-admin -o user,pid,ppid,comm,args \[27m
+[7m  | grep '[a]gent-app-linux-arm64'[27m
+
+[7msudo ss -lntp 'sport = :15034'[27m
+[A[A[A[A[A[A[A[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[Cecho "===== 앱 프로세스 및 LISTEN 확인 ====="
+date
+
+ps -u agent-admin -o user,pid,ppid,comm,args \
+  | grep '[a]gent-app-linux-arm64'
+
+sudo ss -lntp 'sport = :15034'
+[A
+[?2004l===== 앱 프로세스 및 LISTEN 확인 =====
+Thu Oct  1 01:39:25 AM UTC 2026
+agent-a+    3947    3946 agent-app-linux ./[01;31m[Kagent-app-linux-arm64[m[K
+agent-a+    3948    3947 agent-app-linux ./[01;31m[Kagent-app-linux-arm64[m[K
+[sudo] password for cgim: 
+State                   Recv-Q                   Send-Q                                     Local Address:Port                                      Peer Address:Port                  Process                  
+LISTEN                  0                        1                                                0.0.0.0:15034                                          0.0.0.0:*                      users:(("agent-app-linux",pid=3948,fd=4))
+[?2004h]0;cgim@agent-vm: ~[01;32mcgim@agent-vm[00m:[01;34m~[00m$ [7msudoers_tmp=$(mktemp)[27m
+
+[7mprintf '%s\n' \[27m
+[7m  'agent-admin ALL=(root) NOPASSWD: /usr/sbin/ufw status' \[27m
+[7m  > "$sudoers_tmp"[27m
+
+[7msudo visudo -cf "$sudoers_tmp" \[27m
+[7m  && sudo install -o root -g root -m 440 \[27m
+[7m    "$sudoers_tmp" /etc/sudoers.d/agent-monitor[27m
+
+[7mrm -f "$sudoers_tmp"[27m
+[A[A[A[A[A[A[A[A[A[A[A[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[Csudoers_tmp=$(mktemp)
+
+printf '%s\n' \
+  'agent-admin ALL=(root) NOPASSWD: /usr/sbin/ufw status' \
+  > "$sudoers_tmp"
+
+sudo visudo -cf "$sudoers_tmp" \
+  && sudo install -o root -g root -m 440 \
+    "$sudoers_tmp" /etc/sudoers.d/agent-monitor
+
+rm -f "$sudoers_tmp"
+[A
+[?2004l[sudo] password for cgim: 
+/tmp/tmp.jeEto0IOMp: parsed OK
+[?2004h]0;cgim@agent-vm: ~[01;32mcgim@agent-vm[00m:[01;34m~[00m$ [7mecho "===== agent-admin의 UFW 상태 조회 검증 ====="[27m
+[7msudo cat /etc/sudoers.d/agent-monitor[27m
+[7msudo -u agent-admin sudo -n /usr/sbin/ufw status[27m
+[A[A[A[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[Cecho "===== agent-admin의 UFW 상태 조회 검증 ====="
+sudo cat /etc/sudoers.d/agent-monitor
+sudo -u agent-admin sudo -n /usr/sbin/ufw status
+[A
+[?2004l===== agent-admin의 UFW 상태 조회 검증 =====
+agent-admin ALL=(root) NOPASSWD: /usr/sbin/ufw status
+Status: active
+
+To                         Action      From
+--                         ------      ----
+20022/tcp                  ALLOW       Anywhere                  
+15034/tcp                  ALLOW       Anywhere                  
+20022/tcp (v6)             ALLOW       Anywhere (v6)             
+15034/tcp (v6)             ALLOW       Anywhere (v6)             
+
+[?2004h]0;cgim@agent-vm: ~[01;32mcgim@agent-vm[00m:[01;34m~[00m$ sudo tee /home/agent-admin/agent-app/bin/monitor.sh >/dev/null <<'EOF'
+#!/bin/bash
+set -euo pipefail
+export PATH=/usr/sbin:/usr/bin:/sbin:/bin
+export LC_ALL=C
+
+source /etc/profile.d/agent-app.sh
+
+LOG_FILE="$AGENT_LOG_DIR/monitor.log"
+MAX_BYTES=$((10 * 1024 * 1024))
+
+# 동시 실행 방지
+exec 9>"$AGENT_LOG_DIR/.monitor.lock"
+flock -n 9 || exit 0
+
+# 1. 앱 프로세스 확인
+PIDS=$(pgrep -u agent-admin -f \
+  '^(\./|/home/agent-admin/agent-app/)agent-app-linux-arm64([[:space:]]|$)' \
+  | paste -sd, -) || {
+    echo "[ERROR] App process not running"
+    exit 1
+}
+
+# 2. TCP 포트 LISTEN 확인
+if ! ss -H -lnt "sport = :$AGENT_PORT" | grep -q .; then
+    echo "[ERROR] TCP $AGENT_PORT is not LISTEN"
+    exit 1
+fi
+
+echo "[OK] Process PID:$PIDS / TCP $AGENT_PORT LISTEN"
+
+# 3. 방화벽 확인: 실패해도 자원 측정은 계속
+if FW_STATUS=$(sudo -n /usr/sbin/ufw status 2>&1); then
+    if grep -qx 'Status: active' <<< "$FW_STATUS"; then
+        echo "[OK] UFW active"
+    else
+        echo "[WARNING] UFW inactive"
+    fi
+else
+    echo "[WARNING] Cannot query UFW status"
+fi
+
+# 4. 시스템 전체 CPU 사용률: 1초 간격으로 측정
+read_cpu() {
+    local tag user nice system idle iowait irq softirq steal rest
+    read -r tag user nice system idle iowait irq softirq steal rest \
+      < /proc/stat
+    CPU_TOTAL=$((user + nice + system + idle + iowait + irq + softirq + steal))
+    CPU_IDLE=$((idle + iowait))
+}
+
+read_cpuTOTAL_BEFORE=$CPU_TOTALIDLE_BEFORE=$CPU_IDLEsleep 1read_cpuTOTAL_DIFF=$((CPU_TOTAL - TOTAL_BEFORE))[7mIDLE_DIFF=$((CPU_IDLE - IDLE_BEFORE))[27m[7mCPU=$(awk -v total="$TOTAL_DIFF" -v idle="$IDLE_DIFF" \[27m[7m  'BEGIN {[27m[7m    if (total <= 0) print "0.00";[27m[7m    else printf "%.2f", 100 * (total - idle) / total[27m[7m  }')[27m[7m# 5. 시스템 전체 메모리 사용률[27m[7mMEM=$(awk '[27m[7m  /^MemTotal:/ {total=$2}[27m[7m  /^MemAvailable:/ {available=$2}[27m[7m  END {printf "%.2f", 100 * (total-available) / total}[27m[7m' /proc/meminfo)[27m[7m# 6. 루트 파티션 디스크 사용률[27m[7mDISK=$(df -P / | awk 'NR==2 {gsub(/%/, "", $5); print $5}')[27m[7m# 임계값을 초과해도 경고만 출력[27m[7mwarn_above() {[27m[7m    local name=$1 value=$2 limit=$3[27m[7m    if awk -v value="$value" -v limit="$limit" \[27m[7m      'BEGIN {exit !(value > limit)}'; then[27m[7m        echo "[WARNING] $name ${value}% > ${limit}%"[27m[7m    fi[27m[7m}[27m[7mwarn_above CPU "$CPU" 20[27m[7mwarn_above MEM "$MEM" 10[27m[7mwarn_above DISK_USED "$DISK" 80[27m[7mLINE="[$(date '+%Y-%m-%d %H:%M:%S')] PID:$PIDS CPU:${CPU}% MEM:${MEM}% DISK_USED:${DISK}%"[27m[7m# 7. 최대 10MiB씩, 현재 로그 포함 최대 10개 파일[27m[7mif [[ -f "$LOG_FILE" ]]; then[27m[7m    SIZE=$(stat -c %s "$LOG_FILE")[27m[7m    if (( SIZE + ${#LINE} + 1 > MAX_BYTES )); then[27m[7m        rm -f "$LOG_FILE.9"[27m[7m        for ((i=8; i>=1; i--)); do[27m[7m            if [[ -f "$LOG_FILE.$i" ]]; then[27m[7m                mv "$LOG_FILE.$i" "$LOG_FILE.$((i+1))"[27m[7m            fi[27m[7m        done[27m[7m        mv "$LOG_FILE" "$LOG_FILE.1"[27m[7m    fi[27m[7mfi[27m[7mprintf '%s\n' "$LINE" >> "$LOG_FILE"[27m[7mprintf '%s\n' "$LINE"[27m[7mEOF[27mIDLE_DIFF=$((CPU_IDLE - IDLE_BEFORE))CPU=$(awk -v total="$TOTAL_DIFF" -v idle="$IDLE_DIFF" \  'BEGIN {    if (total <= 0) print "0.00";    else printf "%.2f", 100 * (total - idle) / total  }')# 5. 시스템 전체 메모리 사용률MEM=$(awk '  /^MemTotal:/ {total=$2}  /^MemAvailable:/ {available=$2}  END {printf "%.2f", 100 * (total-available) / total}' /proc/meminfo)# 6. 루트 파티션 디스크 사용률DISK=$(df -P / | awk 'NR==2 {gsub(/%/, "", $5); print $5}')# 임계값을 초과해도 경고만 출력warn_above() {    local name=$1 value=$2 limit=$3    if awk -v value="$value" -v limit="$limit" \      'BEGIN {exit !(value > limit)}'; then        echo "[WARNING] $name ${value}% > ${limit}%"    fi}warn_above CPU "$CPU" 20warn_above MEM "$MEM" 10warn_above DISK_USED "$DISK" 80LINE="[$(date '+%Y-%m-%d %H:%M:%S')] PID:$PIDS CPU:${CPU}% MEM:${MEM}% DISK_USED:${DISK}%"# 7. 최대 10MiB씩, 현재 로그 포함 최대 10개 파일if [[ -f "$LOG_FILE" ]]; then    SIZE=$(stat -c %s "$LOG_FILE")    if (( SIZE + ${#LINE} + 1 > MAX_BYTES )); then        rm -f "$LOG_FILE.9"        for ((i=8; i>=1; i--)); do            if [[ -f "$LOG_FILE.$i" ]]; then                mv "$LOG_FILE.$i" "$LOG_FILE.$((i+1))"            fi        done        mv "$LOG_FILE" "$LOG_FILE.1"    fifiprintf '%s\n' "$LINE" >> "$LOG_FILE"printf '%s\n' "$LINE"EOF
+[?2004l[sudo] password for cgim: 
+[?2004h]0;cgim@agent-vm: ~[01;32mcgim@agent-vm[00m:[01;34m~[00m$ [7msudo chown agent-dev:agent-core \[27m
+[7m  /home/agent-admin/agent-app/bin/monitor.sh[27m
+
+[7msudo chmod 750 \[27m
+[7m  /home/agent-admin/agent-app/bin/monitor.sh[27m
+[A[A[A[A[A[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[Csudo chown agent-dev:agent-core \
+  /home/agent-admin/agent-app/bin/monitor.sh
+
+sudo chmod 750 \
+  /home/agent-admin/agent-app/bin/monitor.sh
+[A
+[?2004l[?2004h]0;cgim@agent-vm: ~[01;32mcgim@agent-vm[00m:[01;34m~[00m$ [7mecho "===== monitor.sh 문법 및 권한 확인 ====="[27m
+
+[7msudo -u agent-dev bash -n \[27m
+[7m  /home/agent-admin/agent-app/bin/monitor.sh \[27m
+[7m  && echo "PASS: Bash syntax"[27m
+
+[7msudo stat -c '%A %a %U %G %n' \[27m
+[7m  /home/agent-admin/agent-app/bin/monitor.sh[27m
+
+[7msudo -u agent-admin test -x \[27m
+[7m  /home/agent-admin/agent-app/bin/monitor.sh \[27m
+[7m  && echo "PASS: agent-admin can execute"[27m
+[A[A[A[A[A[A[A[A[A[A[A[A[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[Cecho "===== monitor.sh 문법 및 권한 확인 ====="
+
+sudo -u agent-dev bash -n \
+  /home/agent-admin/agent-app/bin/monitor.sh \
+  && echo "PASS: Bash syntax"
+
+sudo stat -c '%A %a %U %G %n' \
+  /home/agent-admin/agent-app/bin/monitor.sh
+
+sudo -u agent-admin test -x \
+  /home/agent-admin/agent-app/bin/monitor.sh \
+  && echo "PASS: agent-admin can execute"
+[A
+[?2004l===== monitor.sh 문법 및 권한 확인 =====
+PASS: Bash syntax
+-rwxr-x--- 750 agent-dev agent-core /home/agent-admin/agent-app/bin/monitor.sh
+PASS: agent-admin can execute
+[?2004h]0;cgim@agent-vm: ~[01;32mcgim@agent-vm[00m:[01;34m~[00m$ [7mecho "===== 앱 종료 상태 Health Check ====="[27m
+
+[7msudo -u agent-admin \[27m
+[7m  /home/agent-admin/agent-app/bin/monitor.sh[27m
+
+[7mresult=$?[27m
+[7mecho "종료 코드: $result"[27m
+[A[A[A[A[A[A[A[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[Cecho "===== 앱 종료 상태 Health Check ====="
+
+sudo -u agent-admin \
+  /home/agent-admin/agent-app/bin/monitor.sh
+
+result=$?
+echo "종료 코드: $result"
+[A
+[?2004l===== 앱 종료 상태 Health Check =====
+[ERROR] App process not running
+종료 코드: 1
+[?2004h]0;cgim@agent-vm: ~[01;32mcgim@agent-vm[00m:[01;34m~[00m$ [7mecho "===== 앱 실행 상태 모니터링 ====="[27m
+
+[7msudo -u agent-admin \[27m
+[7m  /home/agent-admin/agent-app/bin/monitor.sh[27m
+
+[7mresult=$?[27m
+[7mecho "종료 코드: $result"[27m
+[A[A[A[A[A[A[A[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[Cecho "===== 앱 실행 상태 모니터링 ====="
+
+sudo -u agent-admin \
+  /home/agent-admin/agent-app/bin/monitor.sh
+
+result=$?
+echo "종료 코드: $result"
+[A
+[?2004l===== 앱 실행 상태 모니터링 =====
+[OK] Process PID:4048,4049 / TCP 15034 LISTEN
+[OK] UFW active
+[WARNING] MEM 15.70% > 10%
+[2026-10-01 02:51:11] PID:4048,4049 CPU:2.73% MEM:15.70% DISK_USED:49%
+종료 코드: 0
+[?2004h]0;cgim@agent-vm: ~[01;32mcgim@agent-vm[00m:[01;34m~[00m$ [7mecho "===== 로그 저장 및 누적 확인 ====="[27m
+
+[7msudo -u agent-admin \[27m
+[7m  /home/agent-admin/agent-app/bin/monitor.sh[27m
+
+[7msudo tail -n 5 /var/log/agent-app/monitor.log[27m
+[7msudo wc -l /var/log/agent-app/monitor.log[27m
+[A[A[A[A[A[A[A[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[Cecho "===== 로그 저장 및 누적 확인 ====="
+
+sudo -u agent-admin \
+  /home/agent-admin/agent-app/bin/monitor.sh
+
+sudo tail -n 5 /var/log/agent-app/monitor.log
+sudo wc -l /var/log/agent-app/monitor.log
+[A
+[?2004l===== 로그 저장 및 누적 확인 =====
+[OK] Process PID:4048,4049 / TCP 15034 LISTEN
+[OK] UFW active
+[WARNING] MEM 17.41% > 10%
+[2026-10-01 02:51:32] PID:4048,4049 CPU:2.23% MEM:17.41% DISK_USED:49%
+[2026-10-01 02:51:11] PID:4048,4049 CPU:2.73% MEM:15.70% DISK_USED:49%
+[2026-10-01 02:51:32] PID:4048,4049 CPU:2.23% MEM:17.41% DISK_USED:49%
+2 /var/log/agent-app/monitor.log
+[?2004h]0;cgim@agent-vm: ~[01;32mcgim@agent-vm[00m:[01;34m~[00m$ [7msudo crontab -u agent-admin -l[27m
+[A[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[Csudo crontab -u agent-admin -l
+[A
+[?2004lno crontab for agent-admin
+[?2004h]0;cgim@agent-vm: ~[01;32mcgim@agent-vm[00m:[01;34m~[00m$ [7mprintf '%s\n' \[27m
+[7m  '* * * * * /home/agent-admin/agent-app/bin/monitor.sh >> /var/log/agent-app/cron-output.log 2>&1' \[27m
+[7m  | sudo crontab -u agent-admin -[27m
+[A[A[A[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[Cprintf '%s\n' \
+  '* * * * * /home/agent-admin/agent-app/bin/monitor.sh >> /var/log/agent-app/cron-output.log 2>&1' \
+  | sudo crontab -u agent-admin -
+[A
+[?2004l[?2004h]0;cgim@agent-vm: ~[01;32mcgim@agent-vm[00m:[01;34m~[00m$ [7mecho "===== agent-admin cron 등록 확인 ====="[27m
+[7msudo crontab -u agent-admin -l[27m
+
+[7mecho "===== 자동 실행 전 로그 줄 수 ====="[27m
+[7mdate[27m
+[7msudo wc -l /var/log/agent-app/monitor.log[27m
+[A[A[A[A[A[A[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[Cecho "===== agent-admin cron 등록 확인 ====="
+sudo crontab -u agent-admin -l
+
+echo "===== 자동 실행 전 로그 줄 수 ====="
+date
+sudo wc -l /var/log/agent-app/monitor.log
+[A
+[?2004l===== agent-admin cron 등록 확인 =====
+* * * * * /home/agent-admin/agent-app/bin/monitor.sh >> /var/log/agent-app/cron-output.log 2>&1
+===== 자동 실행 전 로그 줄 수 =====
+Thu Oct  1 02:54:17 AM UTC 2026
+3 /var/log/agent-app/monitor.log
+[?2004h]0;cgim@agent-vm: ~[01;32mcgim@agent-vm[00m:[01;34m~[00m$ [7msleep 75[27m
+
+[7mecho "===== 자동 실행 후 로그 확인 ====="[27m
+[7mdate[27m
+[7msudo wc -l /var/log/agent-app/monitor.log[27m
+[7msudo tail -n 5 /var/log/agent-app/monitor.log[27m
+[7msudo tail -n 10 /var/log/agent-app/cron-output.log[27m
+[A[A[A[A[A[A[A[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[Csleep 75
+
+echo "===== 자동 실행 후 로그 확인 ====="
+date
+sudo wc -l /var/log/agent-app/monitor.log
+sudo tail -n 5 /var/log/agent-app/monitor.log
+sudo tail -n 10 /var/log/agent-app/cron-output.log
+[A
+[?2004l===== 자동 실행 후 로그 확인 =====
+Thu Oct  1 02:55:42 AM UTC 2026
+4 /var/log/agent-app/monitor.log
+[2026-10-01 02:51:11] PID:4048,4049 CPU:2.73% MEM:15.70% DISK_USED:49%
+[2026-10-01 02:51:32] PID:4048,4049 CPU:2.23% MEM:17.41% DISK_USED:49%
+[2026-10-01 02:54:02] PID:4048,4049 CPU:2.50% MEM:17.15% DISK_USED:49%
+[2026-10-01 02:55:02] PID:4048,4049 CPU:2.52% MEM:17.86% DISK_USED:49%
+[OK] Process PID:4048,4049 / TCP 15034 LISTEN
+[OK] UFW active
+[WARNING] MEM 17.15% > 10%
+[2026-10-01 02:54:02] PID:4048,4049 CPU:2.50% MEM:17.15% DISK_USED:49%
+[OK] Process PID:4048,4049 / TCP 15034 LISTEN
+[OK] UFW active
+[WARNING] MEM 17.86% > 10%
+[2026-10-01 02:55:02] PID:4048,4049 CPU:2.52% MEM:17.86% DISK_USED:49%
+[?2004h]0;cgim@agent-vm: ~[01;32mcgim@agent-vm[00m:[01;34m~[00m$ [7mecho "===== 포트 부재 Health Check 테스트 ====="[27m
+
+[7msudo unshare --net -- \[27m
+[7m  sudo -u agent-admin \[27m
+[7m  /home/agent-admin/agent-app/bin/monitor.sh[27m
+
+[7mresult=$?[27m
+[7mecho "종료 코드: $result"[27m
+[A[A[A[A[A[A[A[A[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[Cecho "===== 포트 부재 Health Check 테스트 ====="
+
+sudo unshare --net -- \
+  sudo -u agent-admin \
+  /home/agent-admin/agent-app/bin/monitor.sh
+
+result=$?
+echo "종료 코드: $result"
+[A
+[?2004l===== 포트 부재 Health Check 테스트 =====
+[ERROR] TCP 15034 is not LISTEN
+종료 코드: 1
+[?2004h]0;cgim@agent-vm: ~[01;32mcgim@agent-vm[00m:[01;34m~[00m$ [7msudo -u agent-admin \[27m
+[7m  /home/agent-admin/agent-app/bin/monitor.sh[27m
+[A[A[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[Csudo -u agent-admin \
+  /home/agent-admin/agent-app/bin/monitor.sh
+[A
+[?2004l[OK] Process PID:4048,4049 / TCP 15034 LISTEN
+[OK] UFW active
+[WARNING] MEM 16.24% > 10%
+[2026-10-01 02:57:43] PID:4048,4049 CPU:0.50% MEM:16.24Script started on 2026-10-29 00:27:20+00:00 [TERM="xterm-256color" TTY="/dev/pts/0" COLUMNS="208" LINES="51"]
+[?2004h]0;cgim@agent-vm: ~[01;32mcgim@agent-vm[00m:[01;34m~[00m$ [7mecho "===== 로그 회전 검증 준비 ====="[27m
+
+[7mTEST_DIR=$(sudo -u agent-admin mktemp -d \[27m
+[7m  /var/log/agent-app/rotation-test.XXXXXX)[27m
+
+[7mecho "테스트 경로: $TEST_DIR"[27m
+[7msudo stat -c '%A %a %U %G %n' "$TEST_DIR"[27m
+[A[A[A[A[A[A[A[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[Cecho "===== 로그 회전 검증 준비 ====="
+
+TEST_DIR=$(sudo -u agent-admin mktemp -d \
+  /var/log/agent-app/rotation-test.XXXXXX)
+
+echo "테스트 경로: $TEST_DIR"
+sudo stat -c '%A %a %U %G %n' "$TEST_DIR"
+[A
+[?2004l===== 로그 회전 검증 준비 =====
+[sudo] password for cgim: 
+테스트 경로: /var/log/agent-app/rotation-test.uOFCS4
+drwx--S--- 2700 agent-admin agent-core /var/log/agent-app/rotation-test.uOFCS4
+[?2004h]0;cgim@agent-vm: ~[01;32mcgim@agent-vm[00m:[01;34m~[00m$ [K]0;cgim@agent-vm: ~[01;32mcgim@agent-vm[00m:[01;34m~[00m$ [K]0;cgim@agent-vm: ~[01;32mcgim@agent-vm[00m:[01;34m~[00m$ [K]0;cgim@agent-vm: ~[01;32mcgim@agent-vm[00m:[01;34m~[00m$ [K]0;cgim@agent-vm: ~[01;32mcgim@agent-vm[00m:[01;34m~[00m$ ls[K[K[7mecho "===== 로그 회전 테스트용 스크립트 확인 ====="[27m
+
+[7msudo grep -nE '^(source |AGENT_LOG_DIR=|LOG_FILE=)' \[27m
+[7m  "$TEST_DIR/monitor-test.sh"[27m
+
+[7msudo -u agent-admin bash -n "$TEST_DIR/monitor-test.sh" \[27m
+[7m  && echo "PASS: test script syntax"[27m
+
+[7msudo stat -c '%A %a %U %G %n' "$TEST_DIR/monitor-test.sh"[27m
+[A[A[A[A[A[A[A[A[A[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[Cecho "===== 로그 회전 테스트용 스크립트 확인 ====="
+
+sudo grep -nE '^(source |AGENT_LOG_DIR=|LOG_FILE=)' \
+  "$TEST_DIR/monitor-test.sh"
+
+sudo -u agent-admin bash -n "$TEST_DIR/monitor-test.sh" \
+  && echo "PASS: test script syntax"
+
+sudo stat -c '%A %a %U %G %n' "$TEST_DIR/monitor-test.sh"
+[A
+[?2004l===== 로그 회전 테스트용 스크립트 확인 =====
+[sudo] password for cgim: 
+6:source /etc/profile.d/agent-app.sh
+7:AGENT_LOG_DIR=/var/log/agent-app/rotation-test.uOFCS4
+9:LOG_FILE="$AGENT_LOG_DIR/monitor.log"
+PASS: test script syntax
+-rwxr-x--- 750 agent-admin agent-core /var/log/agent-app/rotation-test.uOFCS4/monitor-test.sh
+[?2004h]0;cgim@agent-vm: ~[01;32mcgim@agent-vm[00m:[01;34m~[00m$ [7mecho "===== 로그 회전 전 테스트 파일 ====="[27m
+
+[7msudo find "$TEST_DIR" -maxdepth 1 -type f \[27m
+[7m  -name 'monitor.log*' -printf '%f %s bytes\n' | sort[27m
+
+[7mecho "===== 가장 오래된 로그 ====="[27m
+[7msudo cat "$TEST_DIR/monitor.log.9"[27m
+[A[A[A[A[A[A[A[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[Cecho "===== 로그 회전 전 테스트 파일 ====="
+
+sudo find "$TEST_DIR" -maxdepth 1 -type f \
+  -name 'monitor.log*' -printf '%f %s bytes\n' | sort
+
+echo "===== 가장 오래된 로그 ====="
+sudo cat "$TEST_DIR/monitor.log.9"
+[A
+[?2004l===== 로그 회전 전 테스트 파일 =====
+===== 가장 오래된 로그 =====
+cat: /var/log/agent-app/rotation-test.uOFCS4/monitor.log.9: No such file or directory
+[?2004h]0;cgim@agent-vm: ~[01;32mcgim@agent-vm[00m:[01;34m~[00m$ [7mTEST_DIR=/var/log/agent-app/rotation-test.uOFCS4[27m
+
+[7msudo -u agent-admin bash -c '[27m
+[7m  set -e[27m
+[7m  dir=$1[27m
+
+[7m  truncate -s 10M "$dir/monitor.log"[27m
+
+[7m  for i in {1..9}; do[27m
+[7m    printf "old archive %s\n" "$i" > "$dir/monitor.log.$i"[27m
+[7m  done[27m
+
+[7m  echo "PASS: 테스트 로그 10개 생성"[27m
+[7m' bash "$TEST_DIR"[27m
+[A[A[A[A[A[A[A[A[A[A[A[A[A[A[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[CTEST_DIR=/var/log/agent-app/rotation-test.uOFCS4
+
+sudo -u agent-admin bash -c '
+  set -e
+  dir=$1
+
+  truncate -s 10M "$dir/monitor.log"
+
+  for i in {1..9}; do
+    printf "old archive %s\n" "$i" > "$dir/monitor.log.$i"
+  done
+
+  echo "PASS: 테스트 로그 10개 생성"
+' bash "$TEST_DIR"
+[A
+[?2004lPASS: 테스트 로그 10개 생성
+[?2004h]0;cgim@agent-vm: ~[01;32mcgim@agent-vm[00m:[01;34m~[00m$ [7mecho "===== 로그 회전 전 테스트 파일 ====="[27m
+
+[7msudo find "$TEST_DIR" -maxdepth 1 -type f \[27m
+[7m  -name 'monitor.log*' -printf '%f %s bytes\n' | sort[27m
+
+[7msudo cat "$TEST_DIR/monitor.log.9"[27m
+[A[A[A[A[A[A[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[Cecho "===== 로그 회전 전 테스트 파일 ====="
+
+sudo find "$TEST_DIR" -maxdepth 1 -type f \
+  -name 'monitor.log*' -printf '%f %s bytes\n' | sort
+
+sudo cat "$TEST_DIR/monitor.log.9"
+[A
+[?2004l===== 로그 회전 전 테스트 파일 =====
+monitor.log 10485760 bytes
+monitor.log.1 14 bytes
+monitor.log.2 14 bytes
+monitor.log.3 14 bytes
+monitor.log.4 14 bytes
+monitor.log.5 14 bytes
+monitor.log.6 14 bytes
+monitor.log.7 14 bytes
+monitor.log.8 14 bytes
+monitor.log.9 14 bytes
+old archive 9
+[?2004h]0;cgim@agent-vm: ~[01;32mcgim@agent-vm[00m:[01;34m~[00m$ [7msudo -u agent-admin -H bash -c '[27m
+[7m  source /etc/profile.d/agent-app.sh[27m
+[7m  cd "$AGENT_HOME" || exit 1[27m
+[7m  exec ./agent-app-linux-arm64[27m
+[7m'[27m
+[A[A[A[A[A[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[Csudo -u agent-admin -H bash -c '
+  source /etc/profile.d/agent-app.sh
+  cd "$AGENT_HOME" || exit 1
+  exec ./agent-app-linux-arm64
+'
+[A
+[?2004l>>> Starting Agent Boot Sequence...
+[1/5] Checking User Account               [OK]
+   ... Running as service user 'agent-admin' (uid=1001)
+[2/5] Verifying Environment Variables     [OK]
+   ... All required Envs correct
+[3/5] Checking Required Files             [OK]
+   ... Verified 'secret.key' with correct key string.
+[4/5] Checking Port Availability          [OK]
+   ... Port 15034 is available.
+[5/5] Verifying Log Permission            [OK]
+   ... Log directory is writable: /var/log/agent-app
+------------------------------------------------------------
+All Boot Checks Passed!
+Agent READY
+2026-10-30 00:38:44,002 [INFO] [SafetyGuard] Process priority lowered (nice=10).
+2026-10-30 00:38:44,003 [INFO] Agent listening at port 15034
+2026-10-30 00:38:44,003 [INFO] === Agent Worker Started ===
+2026-10-30 00:38:44,003 [INFO]    > Cycle: 0 -> 256MB/Lv10 -> 0
+2026-10-30 00:38:44,003 [INFO] --- Step Info: Mode=UP, CPU Lv=1, Mem=0MB ---
+2026-10-30 00:38:44,093 [INFO] [Memory] Increasing... (+25 MB) Total: 25 MB
+2026-10-30 00:38:44,093 [INFO] [CPU] Occupy core for 1s (Level 1)
+2026-10-30 00:38:46,095 [INFO] --- Step Info: Mode=UP, CPU Lv=2, Mem=25MB ---
+2026-10-30 00:38:46,162 [INFO] [Memory] Increasing... (+25 MB) Total: 50 MB
+2026-10-30 00:38:46,162 [INFO] [CPU] Occupy core for 2s (Level 2)
+2026-10-30 00:38:49,163 [INFO] --- Step Info: Mode=UP, CPU Lv=3, Mem=50MB ---
+2026-10-30 00:38:49,271 [INFO] [Memory] Increasing... (+25 MB) Total: 75 MB
+2026-10-30 00:38:49,271 [INFO] [CPU] Occupy core for 3s (Level 3)
+2026-10-30 00:38:53,274 [INFO] --- Step Info: Mode=UP, CPU Lv=4, Mem=75MB ---
+2026-10-30 00:38:53,358 [INFO] [Memory] Increasing... (+25 MB) Total: 100 MB
+2026-10-30 00:38:53,358 [INFO] [CPU] Occupy core for 4s (Level 4)
+2026-10-30 00:38:58,362 [INFO] --- Step Info: Mode=UP, CPU Lv=5, Mem=100MB ---
+2026-10-30 00:38:58,405 [INFO] [Memory] Increasing... (+25 MB) Total: 125 MB
+2026-10-30 00:38:58,405 [INFO] [CPU] Occupy core for 5s (Level 5)
+2026-10-30 00:39:04,408 [INFO] --- Step Info: Mode=UP, CPU Lv=6, Mem=125MB ---
+2026-10-30 00:39:04,444 [INFO] [Memory] Increasing... (+25 MB) Total: 150 MB
+2026-10-30 00:39:04,444 [INFO] [CPU] Occupy core for 5s (Level 6)
+^C2026-10-30 00:39:05,033 [INFO] === Agent Shutdown. Releasing resources. ===
+2026-10-30 00:39:05,037 [INFO] User interrupted process. Shutting down gracefully...
+[?2004h]0;cgim@agent-vm: ~[01;32mcgim@agent-vm[00m:[01;34m~[00m$ [7mTEST_DIR=/var/log/agent-app/rotation-test.uOFCS4[27m
+
+[7mecho "===== 로그 회전 실행 ====="[27m
+[7mdate[27m
+[7msudo -u agent-admin bash "$TEST_DIR/monitor-test.sh"[27m
+[A[A[A[A[A[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[CTEST_DIR=/var/log/agent-app/rotation-test.uOFCS4
+
+echo "===== 로그 회전 실행 ====="
+date
+sudo -u agent-admin bash "$TEST_DIR/monitor-test.sh"
+[A
+[?2004l===== 로그 회전 실행 =====
+Fri Oct 30 12:39:54 AM UTC 2026
+[OK] Process PID:64414,64415 / TCP 15034 LISTEN
+[OK] UFW active
+[WARNING] MEM 13.22% > 10%
+[2026-10-30 00:39:55] PID:64414,64415 CPU:2.26% MEM:13.22% DISK_USED:55%
+[?2004h]0;cgim@agent-vm: ~[01;32mcgim@agent-vm[00m:[01;34m~[00m$ [7mecho "===== 회전 후 파일 목록 ====="[27m
+[7msudo find "$TEST_DIR" -maxdepth 1 -type f \[27m
+[7m  -name 'monitor.log*' -printf '%f %s bytes\n' | sort[27m
+
+[7mecho "===== 로그 파일 개수 ====="[27m
+[7msudo find "$TEST_DIR" -maxdepth 1 -type f \[27m
+[7m  -name 'monitor.log*' | wc -l[27m
+
+[7mecho "===== 가장 오래된 보관 로그 ====="[27m
+[7msudo cat "$TEST_DIR/monitor.log.9"[27m
+
+[7mecho "===== 새 로그 내용 ====="[27m
+[7msudo cat "$TEST_DIR/monitor.log"[27m
+[A[A[A[A[A[A[A[A[A[A[A[A[A[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[Cecho "===== 회전 후 파일 목록 ====="
+sudo find "$TEST_DIR" -maxdepth 1 -type f \
+  -name 'monitor.log*' -printf '%f %s bytes\n' | sort
+
+echo "===== 로그 파일 개수 ====="
+sudo find "$TEST_DIR" -maxdepth 1 -type f \
+  -name 'monitor.log*' | wc -l
+
+echo "===== 가장 오래된 보관 로그 ====="
+sudo cat "$TEST_DIR/monitor.log.9"
+
+echo "===== 새 로그 내용 ====="
+sudo cat "$TEST_DIR/monitor.log"
+[A
+[?2004l===== 회전 후 파일 목록 =====
+monitor.log.1 10485760 bytes
+monitor.log.2 14 bytes
+monitor.log.3 14 bytes
+monitor.log.4 14 bytes
+monitor.log.5 14 bytes
+monitor.log.6 14 bytes
+monitor.log.7 14 bytes
+monitor.log 73 bytes
+monitor.log.8 14 bytes
+monitor.log.9 14 bytes
+===== 로그 파일 개수 =====
+10
+===== 가장 오래된 보관 로그 =====
+old archive 8
+===== 새 로그 내용 =====
+[2026-10-30 00:39:55] PID:64414,64415 CPU:2.26% MEM:13.22% DISK_USED:55%
+[?2004h]0;cgim@agent-vm: ~[01;32mcgim@agent-vm[00m:[01;34m~[00m$ [7mecho "===== 최종 증거: SSH 보안 설정 ====="[27m
+[7mdate[27m
+[7msudo /usr/sbin/sshd -T | grep -E '^(port|permitrootlogin) '[27m
+[7msudo ss -lntp 'sport = :20022'[27m
+[A[A[A[A[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[Cecho "===== 최종 증거: SSH 보안 설정 ====="
+date
+sudo /usr/sbin/sshd -T | grep -E '^(port|permitrootlogin) '
+sudo ss -lntp 'sport = :20022'
+[A
+[?2004l===== 최종 증거: SSH 보안 설정 =====
+Fri Oct 30 12:42:35 AM UTC 2026
+[01;31m[Kport [m[K20022
+[01;31m[Kpermitrootlogin [m[Kno
+State                        Recv-Q                       Send-Q                                               Local Address:Port                                                Peer Address:Port                       Process                                                
+LISTEN                       0                            128                                                        0.0.0.0:20022                                                    0.0.0.0:*                           users:(("sshd",pid=47177,fd=3))                       
+LISTEN                       0                            128                                                           [::]:20022                                                       [::]:*                           users:(("sshd",pid=47177,fd=4))                       
+[?2004h]0;cgim@agent-vm: ~[01;32mcgim@agent-vm[00m:[01;34m~[00m$ [7mecho "===== 제출 자료 위치 확인 ====="[27m
+[7mls -lh ~/mission-evidence/[27m
+[7msudo stat -c '%A %a %U %G %n' \[27m
+[7m  /home/agent-admin/agent-app/bin/monitor.sh[27m
+[A[A[A[A[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[Cecho "===== 제출 자료 위치 확인 ====="
+ls -lh ~/mission-evidence/
+sudo stat -c '%A %a %U %G %n' \
+  /home/agent-admin/agent-app/bin/monitor.sh
+[A
+[?2004l===== 제출 자료 위치 확인 =====
+total 3.2M
+-rw-rw-r-- 1 cgim cgim  28K Oct 30 00:44 monitor-setup.txt
+-rw-rw-r-- 1 cgim cgim 3.2M Oct 30 00:41 setup.txt
+-rwxr-x--- 750 agent-dev agent-core /home/agent-admin/agent-app/bin/monitor.sh
+[?2004h]0;cgim@agent-vm: ~[01;32mcgim@agent-vm[00m:[01;34m~[00m$ exit
+[?2004lexit
+
+Script done on 2026-10-30 03:11:23+00:00 [COMMAND_EXIT_CODE="0"]
